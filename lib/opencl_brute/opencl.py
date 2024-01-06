@@ -505,6 +505,108 @@ class opencl_interface:
             for i in range(0, outSize, BLOCK_LEN_BYTES):
                 yield outBytes[i:i + BLOCK_LEN_BYTES]
 
+    # TODO!!!!!!!
+    def run_scrypt_aes_partial(self, sprg, kernelCall, dkIter):
+        N_blocks_bytes = (1 << self.N) * BLOCK_LEN_BYTES
+
+        # no. of cores' memory that we can fit into a single buffer
+        #   (seemingly anyway, why isn't it 2^31?)
+        # note: this is NOT the workgroupsize, nor does it bound it
+        maxGangSize = (1 << 31) // N_blocks_bytes
+        assert maxGangSize > 0, "Uh-oh we couldn't fit a single core's V in a buffer."
+
+        #   A. Before the loop we produce our huge buffers, once only.
+        #   B. Also make our output buffers & numpys now, just once, to save work
+        #     Note these will be atleast big enough throughout the loop: sometimes they'll have extra room.
+        largeBuffers = []
+        outBuffers = []
+        outNumpys = []
+        outSizes = []
+        for gangSize in take_in_chunks(self.sworkgroupsize, maxGangSize):
+            # Produce the large buffer for storing this gang's V arrays
+            # No longer producing a big bytes object in Python
+
+            # arr = np.frombuffer(bytes(gangSize * N_blocks_bytes), dtype=np.uint32)
+            # Why is this read only?
+            arr_g = cl.Buffer(self.ctx, cl.mem_flags.READ_ONLY, size=gangSize * N_blocks_bytes)
+            largeBuffers.append(arr_g)
+
+            # Produce the gang's output buffer and (small) numpy array to copy out to
+            nBytes = BLOCK_LEN_BYTES * gangSize
+            result = np.zeros(nBytes // 4, dtype=np.uint32)
+            assert nBytes == result.nbytes
+            result_g = cl.Buffer(self.ctx, cl.mem_flags.WRITE_ONLY, nBytes)
+            outBuffers.append(result_g)
+            outNumpys.append(result)
+
+            # No output from round 0!
+            outSizes.append(0)
+
+        # ! For minimal latency, we only block just before our next calls to the kernels:
+        #     there is basically no work between the two.
+
+        # Main loop is taking chunks of workgroup size,
+        #   or less if we exhaust the input derived keys iter
+        iterActive = True
+        while iterActive:
+            #   1. Make New SMALL input buffers (derived key buffer, was password & salt)
+            #       if we exhaust dkIter, continue producing 'empty' input buffers, but mark to leave the main loop
+            newInputs = []
+            inCounts = []
+            for gangSize in take_in_chunks(self.sworkgroupsize, maxGangSize):
+                input_g, numEaten = self.make_input_buffer(dkIter, gangSize)
+                iterActive = (numEaten == gangSize)  # note gangSize > 0, so once False this will persist
+                newInputs.append(input_g)
+                inCounts.append(numEaten)
+
+            #   2. (BLOCKING) wait for all our workers to finish (should be at similar times),
+            #       and copy output buffers out to numpy (minimal time loss here, could use
+            #       2 sets of output buffers instead)
+            #   Note we may well have copied too much: this is dealt with in 4. below
+            for outSize, outNumpy, outBuf in zip_longest(outSizes, outNumpys, outBuffers):
+                if outSize > 0:
+                    cl.enqueue_copy(self.queue, outNumpy, outBuf)  # is_blocking defaults to true :)
+
+            # print("Calling kernels..")
+            #   3. (NON-BLOCKING) queue the kernel calls
+            for input_g, arr_g, result_g, inCount in zip_longest(newInputs, largeBuffers, outBuffers, inCounts):
+                if inCount > 0:
+                    dim = (inCount,)
+                    # print("inCount = {}".format(inCount))
+                    # print("All sizes in bytes (hopefully):")
+                    # print("input_g.size = {}".format(input_g.size))
+                    # print("arr_g.size = {}".format(arr_g.size))
+                    # print("result_g.size = {}".format(result_g.size))
+                    # print("\nOpenCL code now:\n")
+                    kernelCall(sprg, (self.queue, dim, None, input_g, arr_g, result_g))
+            # print("Kernels running..")
+
+            #   4. Process the outputs from the last round, yielding now (while the GPUs are busy)
+            #       Also copy the input counts across to output sizes, for the next loop / final processing below
+            for i, (outNumpy, inCount) in enumerate(zip_longest(outNumpys, inCounts)):
+                outSize = outSizes[i]
+
+                assert outSize % BLOCK_LEN_BYTES == 0
+                outBytes = outNumpy.tobytes()
+                for j in range(0, outSize, BLOCK_LEN_BYTES):
+                    yield outBytes[j:j + BLOCK_LEN_BYTES]
+
+                outSizes[i] = inCount * BLOCK_LEN_BYTES
+
+            # Note that if exiting here then we've updated the outSizes & called the functions
+            # Just remains to capture & process the output..
+
+        # print("Dropped out of loop")
+        # Do a final loop of processing output (3 & 2)
+        for outBuf, outNumpy, outSize in zip_longest(outBuffers, outNumpys, outSizes):
+            # (BLOCKING) Copy!
+            cl.enqueue_copy(self.queue, outNumpy, outBuf)
+
+            assert outSize % BLOCK_LEN_BYTES == 0
+            outBytes = outNumpy.tobytes()
+            for i in range(0, outSize, BLOCK_LEN_BYTES):
+                yield outBytes[i:i + BLOCK_LEN_BYTES]
+
 
 def mdpad_128_func(pwdLen, blockSize):
     llen = (pwdLen + 1 + 16)
