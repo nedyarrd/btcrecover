@@ -1141,9 +1141,37 @@ class WalletBitcoinj(object):
                 privkey_wif = base58.b58encode_check(bytes([0x80]) + privkey + bytes([0x1]))
                 logfile.write(privkey_wif + "\n")
 
+    def return_verified_password_or_false(self, passwords): # BIP38 Encrypted Private Keys
+        return self._return_verified_password_or_false_opencl(passwords) if (not isinstance(self.opencl_algo,int)) \
+          else self._return_verified_password_or_false_cpu(passwords)
+
+    def _return_verified_password_or_false_opencl(self, arg_passwords): # BIP38 Encrypted Private Keys
+        l_scrypt = pylibscrypt.scrypt
+        l_aes256_cbc_decrypt = aes256_cbc_decrypt
+        part_encrypted_key   = self._part_encrypted_key
+        scrypt_salt          = self._scrypt_salt
+        scrypt_n             = self._scrypt_n
+        scrypt_r             = self._scrypt_r
+        scrypt_p             = self._scrypt_p
+
+        # Convert strings (lazily) to UTF-16BE bytestrings
+        passwords = map(lambda p: p.encode("utf_16_be", "ignore"), passwords)
+        # clResult = self.opencl_algo.cl_scrypt_aes_part(self.opencl_context_scrypt, passwords, __n__ , __r__, __p__, _desired_key_length__ = 32, __self.salt__, _part_encrytpted_key[32] )
+        # returns false - if password wasnt found
+        # returns password  if it is found
+        count = enumerate(passwords,1)
+        clResult = self.opencl_algo.cl_scrypt_aes_part(self.opencl_context_scrypt, passwords, scrypt_n, scrypt_r, scrypt_p, 32, scrypt_salt, part_encrypted_key)
+        if clResult != False
+           password = password.decode("utf_16_be", "replace")
+           if self._dump_privkeys_file:
+                    self.dump_privkeys(derived_key)
+           return password, count
+       
+       return False,count
+       
     # This is the time-consuming function executed by worker thread(s). It returns a tuple: if a password
     # is correct return it, else return False for item 0; return a count of passwords checked for item 1
-    def return_verified_password_or_false(self, passwords): # Bitcoinj
+    def _return_verified_password_or_false_cpu(self, passwords): # Bitcoinj
         # Copy a few globals into local for a small speed boost
         l_scrypt             = pylibscrypt.scrypt
         l_aes256_cbc_decrypt = aes256_cbc_decrypt
